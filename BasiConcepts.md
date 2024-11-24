@@ -384,3 +384,249 @@ online learning更新模型参数，让模型在用户交互后几小时内就�
 可以设置时间限制，比如超出一个月的item就从物品集移除，减少误删未曝光物品的概率。
 
 ![figures/fig2.png](figures/fig5.jpg)
+
+
+# Part 3: Ranking
+Ranking 包括：粗排、精排、重排；促排和精排原理相似，都是使用模型对item进行打分后排序，只是粗排模型要简单，计算效率高，需要从大量recall的结果中筛选截断一部分；
+而精排模型更复杂，需要更多的特征，更多的计算，但是效果更好。
+
+## 1. Multi-task Learning：多任务学习
+用户-物品交互数据是推荐系统中的重要信息，包括用户的点击、购买、收藏、点赞等行为。这些交互数据反映了用户对物品的兴趣和偏好，是推荐系统训练模型的重要数据来源。
+- impression：曝光，用户看到了该物品
+- clicks: 用户点击物品的行为（点击率=点击次数/曝光次数）
+- likes：用户点赞物品的行为（点赞率=点赞次数/点击次数）
+- collect：用户收藏物品的行为（收藏率=收藏次数/点击次数）
+- shares：用户分享物品的行为（分享率=分享次数/点击次数）
+
+### 排序的依据
+使用Ranking Model预估点击率（CTR），点赞率等指标分数，通过加权和等方式融合分数后对分数进行排序，截断topN作为推荐结果。
+
+![figures/fig2.png](figures/fig6.jpg)
+
+一般如上图所示：
+- 将不同特征进行concat，然后使用一个神经网络（可以是全连接或wide&deep或其他结构），得到一个嵌入表征向量
+- 将该向量分别输入四个不同的下游模型，分别预测点击率，点赞率，收藏率，分享率等指标
+- 最后将这四个指标融合，得到最终的排序分数
+### 排序模型的训练
+
+![figures/fig2.png](figures/fig7.jpg)
+
+yi是用户的行为（0或1），pi是子网络的预测值（0-1之间）。对于每个子网络相当于做二分类。
+
+面对的困难：不平衡。一般常用对**负样本下采样**。
+- 原始正负样本数为n+,n-
+- 负样本下采样，使用采样率α，则采样后负样本数为αn-
+- 由于负样本变少，**预估的指标（点击率）会大于真实点击率，需要进行校准**
+
+![figures/fig2.png](figures/fig8.jpg)
+
+
+
+### **1. 预估值校准的作用**
+预估值校准的目标是让模型的输出分数更接近实际概率（真实点击率 \(p_{\text{true}}\)），而不仅仅是一个用来排序的相对分数。这在以下场景中可能是必要的：
+
+#### **（1）需要解释性**
+校准后的分数可以更直观地解释。例如，如果校准后的预测值是 0.7，那么可以解释为“该用户点击的概率为 70%”。这对业务分析或用户反馈很有帮助。
+
+#### **（2）跨任务或跨模型的一致性**
+- 如果你的系统有多个目标（如点击率、购买率等），校准分数可以确保不同任务的评分在同一范围内（比如概率范围 [0, 1]）。
+- 在多个模型融合（如排序模型与过滤模型结合）时，校准分数可以统一不同模型的分数尺度，避免因分数范围不同引入偏差。
+
+#### **（3）对决策产生影响**
+对于某些推荐系统，不仅仅需要排序结果，还需要使用分数来调整推荐策略。例如：
+- 在 **多目标优化** 中，可能需要根据校准后的概率分数加权不同目标的重要性。
+- 在 **广告竞价系统** 中，校准后的点击率直接参与收益计算（例如计算预期收益）。
+
+---
+
+### **2. 校准对排序的影响**
+从排序模型的角度，如果仅仅关心排序结果，相对大小比绝对值更重要，因此校准并不总是必要。但有以下情况需要考虑：
+
+#### **（1）截断点的位置选择**
+排序模型通常需要预测所有候选物品的分数后，选择前 \(k\) 个结果。如果分数未校准且范围偏移严重，可能会影响截断点附近物品的排序质量。例如：
+- 未校准的分数可能导致前 \(k\) 个物品和第 \(k+1\) 个物品之间的分数差异不具有实际意义。
+
+#### **（2）样本偏置问题**
+排序模型训练时往往使用点击数据，但点击数据通常存在样本偏置（例如展示过的内容被点击的概率远高于未展示内容）。校准可以一定程度上缓解这种偏置，提升预测结果在未展示样本上的鲁棒性。
+
+---
+
+### **3. 校准的必要性分析**
+校准是否必要，具体取决于你的应用场景：
+
+| **场景**                                      | **校准是否必要**                    | **原因**                                                                 |
+|-----------------------------------------------|-------------------------------------|--------------------------------------------------------------------------|
+| **仅关心排序准确性**                          | 不必要                              | 排序仅需要分数的相对大小，校准后的绝对值对结果影响不大。                  |
+| **需要概率解释（如CTR解释）**                 | 必要                                | 校准后的分数可以反映实际点击概率，增强模型的可解释性。                   |
+| **多任务模型需要融合分数（如点击率+转化率）** | 必要                                | 统一分数尺度有助于加权融合不同目标。                                      |
+| **需要跨模型融合（如召回模型与排序模型结合）** | 必要                                | 保证不同模型的输出分数在同一量纲内，有利于融合逻辑。                      |
+| **广告竞价或收益优化**                        | 必要                                | 预测值需直接用于收益计算，因此校准后的概率分数是必要的。                   |
+
+## 2. MMoE: Multi-gate Mixture-of-Experts
+![figures/fig2.png](figures/fig9.jpg)
+
+**MMoE**（**Multi-gate Mixture-of-Experts**）是一种多任务学习（Multi-task Learning）的深度学习模型架构，广泛应用于推荐系统、广告点击率预测等场景，尤其在多目标任务中非常高效。它通过共享专家网络（Experts）和任务特定的门控网络（Gate）来提升多任务建模能力，同时解决多任务之间的冲突问题。
+
+---
+
+### **1. MMoE 的核心思想**
+在多任务学习中，任务之间可能存在竞争或冲突，例如推荐系统中“点击率预测”（CTR）和“转化率预测”（CVR）可能对特征的关注点不同。MMoE 引入了**专家共享机制**和**任务特定的门控网络**，使每个任务可以选择性地利用专家的知识，而不是完全共享或完全独立。
+
+---
+
+### **2. 模型结构**
+
+MMoE 模型由以下几个模块组成：
+
+#### **（1）Shared Experts（共享专家网络）**
+- 多个专家网络（通常是全连接神经网络）用于提取特征，捕捉特征的潜在表示。
+- 专家网络是所有任务共享的，但并非每个任务都使用所有专家的输出。
+
+#### **（2）Task-specific Gates（任务特定的门控网络）**
+- 每个任务有一个独立的门控网络，用于对共享专家的输出进行加权。
+- 门控网络输出一组权重，表示当前任务对各个专家的依赖程度。
+- **Softmax** 用于生成归一化权重，最终对专家的输出进行加权求和，作为每个任务的输入。
+
+#### **（3）Task Towers（任务特定网络）**
+- 每个任务有自己的网络，用于根据门控网络输出的特征进一步优化。
+- 任务特定网络的输出通常是该任务的预测值（例如点击率或转化率）。
+
+---
+
+### **3. 模型流程图**
+MMoE 的整体架构可以总结如下：
+
+```
+输入特征
+   ↓
+共享专家网络（多个专家）
+   ↓
+任务 A 的门控网络  → 专家加权 → 任务 A 的特定网络 → 任务 A 的输出
+任务 B 的门控网络  → 专家加权 → 任务 B 的特定网络 → 任务 B 的输出
+...
+```
+
+- **共享专家**：负责提取基础特征表示。
+- **任务门控**：为每个任务选择最合适的专家。
+- **任务网络**：根据加权后的特征进行预测。
+
+---
+
+### **4. 代码实现（PyTorch）**
+
+以下是一个简单的 MMoE 实现：
+
+```python
+import torch
+import torch.nn as nn
+
+class MMoE(nn.Module):
+    def __init__(self, input_dim, expert_num, expert_hidden_dim, task_num, task_hidden_dim):
+        super(MMoE, self).__init__()
+        self.expert_num = expert_num
+        self.task_num = task_num
+        
+        # 定义专家网络
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, expert_hidden_dim),
+                nn.ReLU()
+            ) for _ in range(expert_num)
+        ])
+        
+        # 定义任务门控网络
+        self.gates = nn.ModuleList([
+            nn.Linear(input_dim, expert_num) for _ in range(task_num)
+        ])
+        
+        # 定义任务特定网络
+        self.towers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(expert_hidden_dim, task_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(task_hidden_dim, 1),
+                nn.Sigmoid()
+            ) for _ in range(task_num)
+        ])
+    
+    def forward(self, x):
+        # 专家网络的输出
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)  # [batch_size, expert_num, hidden_dim]
+        
+        # 各任务的输出
+        task_outputs = []
+        for i, gate in enumerate(self.gates):
+            gate_weights = torch.softmax(gate(x), dim=1)  # [batch_size, expert_num]
+            
+            # einsum:矩阵乘法
+            # gate_weights: [batch_size, expert_num], 
+            # expert_outputs: [batch_size, expert_num, hidden_dim]
+            # gate_output: [batch_size, hidden_dim]
+            gate_output = torch.einsum('be,beh->bh', gate_weights, expert_outputs)  # [batch_size, hidden_dim]
+            task_output = self.towers[i](gate_output)  # [batch_size, 1]
+            task_outputs.append(task_output)
+        
+        return task_outputs  # 每个任务的预测值
+
+# 示例输入
+input_dim = 64
+expert_num = 4
+expert_hidden_dim = 32
+task_num = 3
+task_hidden_dim = 16
+
+model = MMoE(input_dim, expert_num, expert_hidden_dim, task_num, task_hidden_dim)
+x = torch.rand(32, input_dim)  # 32个样本
+outputs = model(x)
+
+# 输出
+for i, output in enumerate(outputs):
+    print(f"Task {i+1} Output Shape: {output.shape}")
+```
+
+### 5. Polarize:极化现象
+MMoE的Gate使用Softmax输出权重，而权重可能导致极化现象，即某个专家权重接近1，其他接近0。这样导致某些expert是死亡的，变成
+普通多目标模型，而并没有融合多专家。
+
+解决方案：专家Dropout
+- 引入动态机制，在每次训练中随机屏蔽部分专家的输出（类似 Dropout），迫使门控网络选择更多的专家。这种方法可以有效减少专家极化现象。
+
+## 3. 预估分数融合
+### 1. 线性加权
+
+简单加权：直接对不同任务的预估分数进行加权求和，得到最终的排序分数。
+- score = p_click+w1*p_like+w2*p_collect+w3*p_share
+
+点击率乘其他项的加权
+- score = p_click*(1+w1*p_like+w2*p_collect+w3*p_share)
+
+### 2. 快手的分数融合
+![figures/fig2.png](figures/fig10.jpg)
+
+### 3. 电商的分数融合
+![figures/fig2.png](figures/fig11.jpg)
+
+## 4. 视频播放建模
+- 图文item排序主要依靠：点击，点赞，收藏，分享等行为，
+- 视频播放建模主要依靠：播放时长，播放次数，播放完成率等指标。（直接做时长回归模型效果不好）
+### 播放时长建模
+![figures/fig2.png](figures/fig12.jpg)
+
+- 上图所示，最右边的全连接层是播放时长的输出（其他是点击率，点赞率等）；
+- 对z做sigmoid变化得到p，训练的时候用y=t/(1+t)作为label，用CE(y,p)作为损失函数;
+- 推理的时候只使用exp(z)，因为CE会最小化p和y的差距，那么可以认为exp(z)和t的差距也会很小。即时长t=exp(z)。
+- 通过这种方式，可以将时长回归问题转化为二分类问题，提高模型的泛化能力。
+- 将exp(z)作为预估分数融合中的一项，影响视频item的排序。
+
+### 完播率建模
+- 回归方法：播放长度/视频长度作为label，p为预估播放率
+  - loss = y*log(p)+(1-y)*log(1-p)
+  - 如果p=0.73：预计播放长度为73%的视频长度
+
+- 二分类：将完播80%的视频作为正样本，其他作为负样本，使用CE作为损失函数
+  - 如果p=0.73：P(播放>=80%)=0.73，即73%的概率播放长度>=80%的视频长度
+
+实际操作不可以直接用完播率作为融分公式的一项，因为完播率和播放时长有相关性，视频时长长的视频完播率可能较低。
+- 对完播率预估值进行adjust：p_adjust = p/f(视频长度)，f(视频长度)是视频长度的函数，可以是线性函数，也可以是其他函数。
+- 视频长度越长，f越小，p_adjust越大，即视频长度越长，完播率得分倾向于更高
+- 将p_adjust作为融分公式的一项，影响视频item的排序。
