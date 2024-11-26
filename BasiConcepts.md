@@ -401,12 +401,22 @@ Ranking 包括：粗排、精排、重排；促排和精排原理相似，都是
 ### 排序的依据
 使用Ranking Model预估点击率（CTR），点赞率等指标分数，通过加权和等方式融合分数后对分数进行排序，截断topN作为推荐结果。
 
+### 精排模型核心：shared bottom
 ![figures/fig2.png](figures/fig6.jpg)
 
 一般如上图所示：
 - 将不同特征进行concat，然后使用一个神经网络（可以是全连接或wide&deep或其他结构），得到一个嵌入表征向量
 - 将该向量分别输入四个不同的下游模型，分别预测点击率，点赞率，收藏率，分享率等指标
 - 最后将这四个指标融合，得到最终的排序分数
+
+上述模型的优点：
+- shared bottom：模型大，需要对融合后的特征进行表征
+- 属于**前期融合**：先对所有特征进行concatenation再输入神经网络
+- 线上推理代价大：给n个item打分需要推理n次
+
+#### 双塔模型属于后期融合：先对不同特征输入不同神经网络，不直接融合特征。优点是线上推理计算量小，用户塔只需要计算一次用户表征a；
+#### 物品表征b可以离线推理后储存在向量数据库，线上推理的时候直接使用
+
 ### 排序模型的训练
 
 ![figures/fig2.png](figures/fig7.jpg)
@@ -477,6 +487,18 @@ yi是用户的行为（0或1），pi是子网络的预测值（0-1之间）。�
 ### **2. 模型结构**
 
 MMoE 模型由以下几个模块组成：
+**示例结构**：
+```text
+         Input Features
+             ↓
+      ┌───────────────┐
+  Expert 1   Expert 2   ...  Expert N
+      │         │               │
+  ┌───▼───┐ ┌───▼───┐     ┌────▼────┐
+  Gate 1   Gate 2   ...     Gate T
+      │         │               │
+ Task 1     Task 2           Task T
+```
 
 #### **（1）Shared Experts（共享专家网络）**
 - 多个专家网络（通常是全连接神经网络）用于提取特征，捕捉特征的潜在表示。
@@ -591,7 +613,107 @@ MMoE的Gate使用Softmax输出权重，而权重可能导致极化现象，即�
 解决方案：专家Dropout
 - 引入动态机制，在每次训练中随机屏蔽部分专家的输出（类似 Dropout），迫使门控网络选择更多的专家。这种方法可以有效减少专家极化现象。
 
-## 3. 预估分数融合
+## 3. PLE: Progressive Layered Extraction
+**PLE（Progressive Layered Extraction）** 和 **MMoE（Multi-gate Mixture-of-Experts）** 是两种常见的多任务学习（MTL）框架，主要用于解决多任务推荐或多目标优化问题。这两种方法有一定相似性，但设计思想和应用场景有所不同。以下是两者的详细对比：
+
+---
+
+### 1. 基本概念
+- **核心思想**：
+  - 在 MMoE 的基础上，进一步将**共享专家**和**任务特定专家**分离，并引入分层特征提取结构。
+  - 通过多层次专家网络对特征逐步提炼，解决任务冲突问题，同时保留任务间协同效应。
+- **优点**：
+  - 更好地缓解任务冲突问题。
+  - 能同时建模任务相关性和任务独立性。
+- **缺点**：
+  - 模型复杂度更高，计算成本相较 MMoE 增加。
+
+---
+
+### **2. 网络架构**
+
+
+---
+
+#### **PLE 的架构**
+1. **共享专家**提取可供所有任务共享的特征。
+2. **任务特定专家**提取专属于每个任务的特定特征。
+3. 每一层通过门控机制动态选择特征来源，并将上一层的输出逐层输入下一层，实现逐步特征提取。
+4. 通过分层设计，逐步将特征分解为任务共享部分和任务特定部分。
+
+**示例结构**：
+```text
+          Input Features
+               ↓
+ ┌──────── Shared Experts ────────┐
+ │                                │
+ Task A Experts          Task B Experts
+       ↓                        ↓
+      Gate A                  Gate B
+       ↓                        ↓
+   Task A Output            Task B Output
+```
+
+---
+
+
+
+
+#### **PLE 示例代码**
+```python
+class PLE(nn.Module):
+    def __init__(self, input_dim, expert_num, expert_dim, task_num):
+        super(PLE, self).__init__()
+        # 共享专家网络
+        self.shared_experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, expert_dim),
+                nn.ReLU()
+            ) for _ in range(expert_num)
+        ])
+        # 每个任务的特定专家网络
+        self.task_experts = nn.ModuleList([
+            nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(input_dim, expert_dim),
+                    nn.ReLU()
+                ) for _ in range(expert_num)
+            ]) for _ in range(task_num)
+        ])
+        # 门控网络
+        self.gates = nn.ModuleList([
+            nn.Linear(input_dim, expert_num * 2) for _ in range(task_num)
+        ])
+        # 任务特定塔层
+        self.towers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(expert_dim, 1),
+                nn.Sigmoid()
+            ) for _ in range(task_num)
+        ])
+
+    def forward(self, x):
+        # 获取共享专家的输出
+        shared_outputs = torch.stack([expert(x) for expert in self.shared_experts], dim=1)
+        task_outputs = []
+        for i, task_expert in enumerate(self.task_experts):
+            # 获取任务特定专家的输出
+            task_specific_outputs = torch.stack([expert(x) for expert in task_expert], dim=1)
+            # 拼接共享专家和任务特定专家的输出
+            all_expert_outputs = torch.cat([shared_outputs, task_specific_outputs], dim=1)
+            # 门控机制
+            gate_weights = torch.softmax(self.gates[i](x), dim=1)
+            gate_output = torch.einsum('be,bne->bn', gate_weights, all_expert_outputs)
+            # 任务特定塔层输出
+            task_outputs.append(self.towers[i](gate_output))
+        return task_outputs
+```
+
+#### 关于Experts 和 Gates：
+对于MMoE和PLE的Experts，一般来说每个下游任务有一个gate，该gate对所有experts进行加权。而PLE有一些shared experts用于所有任务，
+还有一些task-specific experts用于特定任务。
+
+## 4. 预估分数融合
 ### 1. 线性加权
 
 简单加权：直接对不同任务的预估分数进行加权求和，得到最终的排序分数。
@@ -606,7 +728,7 @@ MMoE的Gate使用Softmax输出权重，而权重可能导致极化现象，即�
 ### 3. 电商的分数融合
 ![figures/fig2.png](figures/fig11.jpg)
 
-## 4. 视频播放建模
+## 5. 视频播放建模
 - 图文item排序主要依靠：点击，点赞，收藏，分享等行为，
 - 视频播放建模主要依靠：播放时长，播放次数，播放完成率等指标。（直接做时长回归模型效果不好）
 ### 播放时长建模
@@ -630,3 +752,79 @@ MMoE的Gate使用Softmax输出权重，而权重可能导致极化现象，即�
 - 对完播率预估值进行adjust：p_adjust = p/f(视频长度)，f(视频长度)是视频长度的函数，可以是线性函数，也可以是其他函数。
 - 视频长度越长，f越小，p_adjust越大，即视频长度越长，完播率得分倾向于更高
 - 将p_adjust作为融分公式的一项，影响视频item的排序。
+
+## 6. 排序模型的特征
+### 1. 用户画像 User Profile
+- UID: 在召回，排序中进行embedding，一般用32维或64维向量
+- 统计学属性：性别，年龄等
+- 账号信息：新老用户，活跃度等
+- 用户感兴趣类目：关键词，品牌等
+
+### 2. 物品画像 Item Profile
+- 物品id：embedding
+- 发布时间：一般时间越长的物品，权重越低（更关注近期内容）
+- GeoHash（经纬度编码），所在城市等
+- 物品内容：标题，类目，关键词，品牌等（一般是分类变量，做embedding）
+- 物品特征：字数，图片数，视频清晰度，标签是数等，反应item质量
+- 内容信息量，图片美学等：使用cv，nlp模型对这些特征打分并融入item画像作为特征
+
+### 3. 用户统计特征
+- 用户在不同时间粒度下的点击数，点赞数等
+- 用户分别对图文item，视频item的点击率等，反应对不同item的偏好
+- 对item类目的点击率：比如对美妆类，科技类等细分领域维度
+
+### 4. 笔记统计特征
+- 笔记在不同时间的曝光数，点击数等
+- 按照item受众分桶，比如item来自不同性别用户，不同年龄用户的点击
+- 作者特征：作者发布的item数，粉丝数，消费指标（item的曝光数，点击数点赞数等）
+
+### 5. 场景特征 Context
+- 用户定位GeoHash
+- 当前时刻：分段做embedding
+- 是否是周末，节假日等
+- 手机品牌，手机型号，操作系统（比如安卓和苹果用户的点赞率等指标有显著差异）
+
+### 特征处理
+- 离散特征：embedding
+  - 用户id，itemId，作者ID
+  - 类目，关键词，城市等
+- 连续特征：分桶，变成离散特征
+  - 年龄，笔记字数，视频长度等，先分桶为不同年龄组等离散特征，然后可以onehot或embedding
+  - 点击数，曝光数等数值很大，可以做log变换：log(1+x)
+    - 或者转换为点击率，点赞率，并做平滑处理
+
+### 特征覆盖率
+- 很多特征无法覆盖100%样本---存在缺失值；比如一些用户不填写年龄等
+- 对于重要的特征，可以提高覆盖率来提高精排模型准度
+
+![figures/fig2.png](figures/fig13.jpg)
+
+
+## 7. 粗排 Pre-Ranking
+前面部分的排序模型主要用于精排，需要高准度，单次推理代价大，同时样本量也比较小。
+而粗排需要给更多item打分，单次推理代价要求小，可以牺牲一定的准度
+
+一般前期融合（先对各种特征concatenation再输入一个shared bottom）用于精排阶段，而比如双塔模型等属于后期融合（分别将不同特征输入不同神经网络）用于粗排或召回
+
+### 三塔模型
+![figures/fig2.png](figures/fig14.png)
+
+- 用户Tower：用户特征，场景特征
+  - 对于一个用户只需要推理一次，所以用户塔可以很大，实际推理代价也不高
+- 物品Tower：物品特征（静态）
+  - 有n个item，每次给一个user做推荐则需要进行n次推理
+  - 由于一般item属性较为稳定，可以缓存物品塔的输出向量
+  - 一般线上不需要再推理，只有出现新item才需要推理
+- 交叉Tower：统计特征，用户特征和物品特征交叉
+  - 统计特征（点击率等）在每次交互后会变化，需要实时更新
+  - 有n个item，必须做n次推理
+  - 所以交叉塔需要足够小，推理代价低
+- 三个Tower输出三个向量表征，对三个向量进行concatenation和cross
+  - 把上述得到的一个向量分别输入不同的下游任务，输出点击率，点赞率，转发率等预估
+  - 介于前期融合和后期融合之间
+- 上层网络（用于输出点击率等指标的预估值）
+  - 对每一个user的推荐请求，需要做n次推理，对n个item打分，代价大
+  - 大部分粗排计算量都在上层网络部分
+
+# Part 4: 特征交叉（Feature Cross）
+## 1. Factorized Machine（FM）
