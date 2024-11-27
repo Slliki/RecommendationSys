@@ -828,3 +828,249 @@ class PLE(nn.Module):
 
 # Part 4: 特征交叉（Feature Cross）
 ## 1. Factorized Machine（FM）
+FM是线性模型的改进，引入二阶交叉项来提升模型表达能力。FM模型的核心思想是将特征的交叉项分解为两个低维向量的内积，从而降低模型的复杂度。
+
+## 2. DCN: Deep & Cross Network 深度交叉网络
+DCN是一种结合了深度神经网络和特征交叉的模型，通过交叉层实现特征交叉，通过深度网络学习特征的高阶交叉。
+
+之前提到的召回和排序模型中的`双塔模型`,`多目标学习模型`，`MMoE`等只是模型框架结构，其中的Tower和MMoE的shared bottom，Experts等都可以使用简单全连接网络或DCN或其他更复杂的网络结构。
+
+![figures/fig2.png](figures/fig15.jpg)
+
+### DCN的模型结构
+DCN由两部分组成：
+1. **交叉网络（Cross Network）**：
+   - 显式学习特征的高阶交叉。
+   - 通过逐层递归的方式，将输入特征进行多阶交叉组合。
+
+2. **深度网络（Deep Network）**：
+   - 使用多层感知机（MLP）学习特征的隐式交叉。
+   - 包括多层全连接层，后接激活函数（如ReLU）。
+
+3. **联合输出层**：
+   - 将交叉网络和深度网络的输出进行融合（如拼接），最终接入一个全连接层，用于最终预测。
+
+
+### 1. Cross Layer
+深度交叉网络（Deep Cross Network, DCN）是一种用于特征交叉与组合的深度学习模型，常用于推荐系统和广告点击率预估任务中。DCN 的目标是通过高效地学习特征交叉来捕捉特征之间的非线性关系，从而提高模型的预测效果。
+- x_i+1 = x_0 * (W*x_i + b_i) + x_i
+- W*x_i + b_i是一个全连接层，x_0是输入特征，x_i是交叉层的输出，x_i+1是下一层的输入
+
+![figures/fig2.png](figures/fig16.jpg)
+
+### 2. Code Implementation
+```python
+class CrossLayer(nn.Module):
+    """
+    Cross Layer for explicit feature crossing
+    """
+    def __init__(self, input_dim):
+        super(CrossLayer, self).__init__()
+        self.weight = nn.Parameter(torch.randn(input_dim, 1))  # Learnable weight
+        self.bias = nn.Parameter(torch.randn(input_dim))      # Learnable bias
+
+    def forward(self, x0, xl):
+        # Cross layer computation: x_{l+1} = x0 * (w^T * xl) + b + xl
+        cross_term = torch.matmul(xl, self.weight)  # (batch_size, 1)
+        cross_term = x0 * cross_term                # Element-wise product with x0
+        return cross_term + self.bias + xl          # Add bias and residual connection
+
+class CrossNetwork(nn.Module):
+    """
+    Cross Network: Stack of Cross Layers
+    """
+    def __init__(self, input_dim, num_layers):
+        super(CrossNetwork, self).__init__()
+        # 创建多个 CrossLayer，每一层的输入都是 (x0, xi)
+        self.cross_layers = nn.ModuleList([CrossLayer(input_dim) for _ in range(num_layers)])
+
+    def forward(self, x):
+        x0 = x  # 保存初始输入 x0
+        for layer in self.cross_layers:
+            # 每一层接收 (x0, xi) 作为输入，x0 是初始输入，xi 是前一层的输出
+            x = layer(x0, x)  # 每个 CrossLayer 的输入包括 x0 和当前的 x（上一层的输出）
+        return x
+
+
+class DeepNetwork(nn.Module):
+    """
+    Deep Network: Multi-Layer Perceptron (MLP) for implicit feature interaction
+    """
+    def __init__(self, input_dim, hidden_dims):
+        super(DeepNetwork, self).__init__()
+        layers = []
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(0.5))  # Optional: Dropout for regularization
+            input_dim = hidden_dim
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.mlp(x)
+
+class DCNv2(nn.Module):
+    """
+    DCNv2: Combines Cross Network and Deep Network
+    """
+    def __init__(self, input_dim, cross_layers, hidden_dims):
+        super(DCNv2, self).__init__()
+        self.cross_network = CrossNetwork(input_dim, cross_layers)
+        self.deep_network = DeepNetwork(input_dim, hidden_dims)
+        self.output_layer = nn.Linear(input_dim + hidden_dims[-1], 1)  # Final output layer
+
+    def forward(self, x):
+        # Explicit feature crossing
+        cross_out = self.cross_network(x)
+
+        # Implicit feature interaction
+        deep_out = self.deep_network(x)
+
+        # Concatenate outputs from cross network and deep network
+        combined = torch.cat([cross_out, deep_out], dim=1)
+
+        # Output layer (e.g., for binary classification or regression)
+        return torch.sigmoid(self.output_layer(combined))
+```
+
+## 3. LHUC(PPNet): Learning Hidden Unit Contributions
+LHUC起源于语音识别（2016），后来常用于精排模型（PPNet）。LHUC的主要目标是通过为每个隐藏单元引入一个权重系数（即“贡献”），来提高模型对输入的适应性。这些贡献系数是可以训练的参数，模型通过学习这些系数，调整每个神经单元的权重，从而在不同的输入数据上表现出更好的灵活性和表达能力。
+
+![figures/fig2.png](figures/fig17.jpg)
+
+- item feature：用简单全连接层处理得到嵌入
+- user feature：用MLP处理，并连接sigmoid，将结果*2（sigmoid结果在0-1，*2后结果在0-2）
+- 两者输出的向量做element-wise相乘，得到最终的特征向量
+- 可以继续堆叠上述结构，得到更复杂的模型
+- 实际上是使用 用户特征 来作为 可学习的权重 来调整（或“缩放”） 物品（Item）特征，这一过程可以看作是 LHUC 的一种应用
+- 模型可以根据不同用户的特征，动态调整每个物品的特征表示。这可以帮助模型根据每个用户的兴趣和行为，对物品的表示进行不同程度的调整
+- 通过学习和优化这些权重，模型能够更好地适应不同用户的需求，尤其是在冷启动问题或数据稀疏的情况下，能够更灵活地调整每个用户和物品的特征交互。
+
+## 4. SENet
+**SENet**（**Squeeze-and-Excitation Networks**）是一种用于提升深度学习模型性能的网络架构，最初提出用于计算机视觉任务中的图像分类。SENet的核心思想是通过 **自适应地调整通道之间的权重**，来提升模型对重要特征的关注能力，从而增强模型的表达能力。它通过引入 **Squeeze-and-Excitation** 操作，在每个卷积层后加上一个 **自适应重标定机制**，使网络可以根据输入特征的不同，自动调整通道的重要性。
+
+### **SENet的核心思想：**
+
+1. **Squeeze（压缩）**：首先，通过全局平均池化将输入特征图的空间维度压缩为一个通道描述符。这个描述符反映了每个通道的重要性。
+   
+2. **Excitation（激励）**：接着，通过一个 **全连接层（FC layer）** 和一个 **sigmoid 激活函数**，生成每个通道的 **注意力系数**。这些系数会告诉模型每个通道的重要性，即该通道对最终输出的贡献。
+
+3. **重标定**：最后，将 **激励系数** 与原始输入特征图的每个通道相乘，来重新调整各个通道的响应。这样，模型就能更关注重要的通道特征，并抑制不重要的通道特征。
+
+### **SENet在推荐系统中的应用：**
+
+虽然SENet最早是为计算机视觉任务设计的，但其自适应权重调整的思想同样可以应用到 **推荐系统** 中。推荐系统通常面临着多个特征之间的相互作用，而SENet的 **通道注意力机制** 可以帮助模型动态地选择和调整哪些特征对最终预测更为重要。
+
+在推荐系统中，SENet的主要应用可能体现在以下几个方面：
+
+1. **特征选择与加权**：
+   - 在传统的推荐系统中，用户和物品的特征通常是通过嵌入层表示的，并通过神经网络进行处理。SENet可以通过 **自适应调整** 每个特征嵌入的权重，让模型更加关注与当前用户或物品相关的特征。
+
+2. **增强特征交互**：
+   - 推荐系统中，用户和物品特征的交互非常关键，尤其是对于深度神经网络模型。SENet通过自动选择重要的特征通道，可以增强模型对于特征交互的学习能力，从而更好地捕捉 **用户-物品的复杂关系**。
+
+3. **提高个性化推荐的效果**：
+   - 每个用户的兴趣和物品的特性不同，SENet的注意力机制可以让模型更加关注用户当前偏好的物品特征和行为模式，提升 **个性化推荐** 的效果。
+
+# Part 5: 用户行为建模
+## 1. LastN模型
+- 主要使用用户最后交互过的N个item进行embedding（包括item的id，以及其他物品特征等）
+- 得到你N个嵌入向量，对N个向量取平均得到一个向量，表示用户最近感兴趣的物品
+- 将LastN特最终的特征与其他特征cat，输入到召回，排序模型中
+- LastN可用于召回双塔，粗排三塔，精排等模型
+- LastN包括点击，点赞，收藏等行为的item。
+
+## 2. DIN: Deep Interest Network
+用加权平均代替LastN的简单平均，类似注意力机制。
+- 对于某候选物品（比如粗排的结果item是精排的候选item），计算与用户LastN物品的相似度
+- 用相似度作为权重，计算LastN物品的加权平均，得到一个向量
+- 把上面的结果想了作为一种用户特征输入排序模型
+
+### 1. **DIN 模型的核心思想**
+
+DIN 模型的核心是**动态兴趣建模**，即模型能够根据当前推荐的物品（或广告），动态地从用户的历史行为中挑选出与当前物品最相关的历史行为，并对这些历史行为给予更多关注，从而更准确地建模用户的兴趣。其基本思想是：
+
+- **兴趣历史选择**：模型根据当前的推荐物品，选择用户历史行为中与当前物品相关的部分作为动态兴趣。
+- **用户行为建模**：通过注意力机制或者其他方法，将用户与物品之间的交互历史进行建模，以便更好地捕捉用户兴趣的时序性变化。
+  
+
+### 2. **DIN 模型的注意力机制**
+
+在 DIN 模型中，**注意力机制**（Attention Mechanism）是核心组成部分，它用于对用户历史行为进行加权选择。具体而言，DIN 通过以下方式进行兴趣历史的加权：
+
+- **查询（Query）**：候选物品的嵌入表示。
+- **键（Key）**：用户历史行为中的物品嵌入表示。
+- **值（Value）**：用户历史行为中每个物品的嵌入表示。
+
+注意力机制通过计算当前物品与历史物品的相似度（通常使用点积）来决定历史行为的加权系数。然后，基于这些加权系数，将用户历史行为向量加权求和，得到最终的动态兴趣表示。
+
+### 3. **DIN 模型的具体结构图**
+
+以下是 DIN 模型的一般结构：
+
+1. **输入：**
+   - 用户的历史行为序列：包括历史物品的 ID。
+   - 当前推荐的物品的 ID。
+
+2. **嵌入层：**
+   - 用户和物品的 ID 都经过嵌入层（Embedding）转化为低维向量。
+   
+3. **动态兴趣建模：**
+   - 当前推荐的物品作为查询（Query），与用户历史行为中的每个物品进行相似度计算，得到注意力权重。
+   - 然后，使用这些权重对用户历史行为进行加权求和，得到动态兴趣向量。
+
+4. **兴趣匹配：**
+   - 将动态兴趣向量与当前推荐的物品的嵌入向量进行匹配（通常是通过点积或其他相似度计算方法）。
+
+5. **输出：**
+   - 将匹配结果输入到一个全连接层，输出用户对该物品的兴趣评分或点击概率。
+
+**DIN 模型的代码实现概述**
+
+```python
+class DIN(nn.Module):
+    def __init__(self, user_size, item_size, embedding_dim, hidden_dim):
+        super(DIN, self).__init__()
+        
+        # 用户和物品的嵌入层
+        self.user_embedding = nn.Embedding(user_size, embedding_dim)
+        self.item_embedding = nn.Embedding(item_size, embedding_dim)
+        
+        # 历史行为的嵌入层
+        self.history_item_embedding = nn.Embedding(item_size, embedding_dim)
+        
+        # 动态兴趣建模中的注意力机制
+        self.attention_weight = nn.Linear(embedding_dim, 1)
+        
+        # 全连接层，用于预测输出
+        self.fc = nn.Sequential(
+            nn.Linear(embedding_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+    
+    def forward(self, user_id, item_id, history_item_ids):
+        # 获取用户和当前物品的嵌入向量
+        user_emb = self.user_embedding(user_id)
+        item_emb = self.item_embedding(item_id)
+        
+        # 获取用户历史物品的嵌入向量
+        history_emb = self.history_item_embedding(history_item_ids)  # (batch_size, history_len, embedding_dim)
+        
+        # 计算注意力得分
+        attention_score = torch.matmul(history_emb, item_emb.unsqueeze(2))  # (batch_size, history_len, 1)
+        attention_score = torch.squeeze(attention_score, dim=2)  # (batch_size, history_len)
+        attention_weights = F.softmax(attention_score, dim=1)  # (batch_size, history_len)
+        
+        # 使用注意力权重对历史物品嵌入加权
+        # 沿着dim=1：history_len的方向，对每个历史物品嵌入进行加权求和
+        weighted_history_emb = torch.sum(history_emb * attention_weights.unsqueeze(2), dim=1) # (batch_size, embedding_dim)
+        
+        # 将当前物品的嵌入和加权历史嵌入连接
+        interaction = torch.cat([item_emb, weighted_history_emb], dim=1) # (batch_size, embedding_dim * 2)
+        
+        # 全连接层预测评分
+        output = self.fc(interaction) # (batch_size, 1)
+        return output
+```
+
