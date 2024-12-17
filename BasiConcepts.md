@@ -635,83 +635,177 @@ MMoE的Gate使用Softmax输出权重，而权重可能导致极化现象，即�
 
 ---
 
-### **2. 网络架构**
 
+
+#### **与 MMoE 的区别**
+- **MMoE**：所有任务共享一组专家网络，通过门控网络选择不同专家输出进行加权。  
+   **缺点**：任务间存在冲突时，共享专家可能无法完全满足各任务的特异性需求。
+- **PLE**：将专家网络分为**共享专家**和**任务特定专家**，逐层提取特征，**强化任务特异性学习**，同时保留任务间共享特征。
 
 ---
 
-#### **PLE 的架构**
-1. **共享专家**提取可供所有任务共享的特征。
-2. **任务特定专家**提取专属于每个任务的特定特征。
-3. 每一层通过门控机制动态选择特征来源，并将上一层的输出逐层输入下一层，实现逐步特征提取。
-4. 通过分层设计，逐步将特征分解为任务共享部分和任务特定部分。
 
-**示例结构**：
-```text
-          Input Features
-               ↓
- ┌──────── Shared Experts ────────┐
- │                                │
- Task A Experts          Task B Experts
-       ↓                        ↓
-      Gate A                  Gate B
-       ↓                        ↓
-   Task A Output            Task B Output
+### 2.网络架构
+#### 1. **输入层**  
+   - 输入原始特征作为模型的输入。
+
+#### 2. **任务共享专家与任务特定专家**  
+   - **共享专家**：学习任务间的公共特征表示。  
+   - **任务特定专家**：学习各任务的特异性特征表示，满足任务个性化需求。
+
+#### 3. **逐层特征提取（Progressive Layered Extraction）**  
+   - 每一层的专家输出会被送入下一层进行进一步提取，并且输出分为：
+     - **共享部分**：供所有任务共享。
+     - **任务特定部分**：供各任务独立使用。
+
+#### 4. **门控网络（Gates）**  
+   - 每个任务都有一个独立的门控网络，用于融合当前层共享专家与任务特定专家的输出。
+
+#### 5. **任务输出塔（Task Towers）**  
+   - 每个任务最终输出由任务特定特征表示与共享特征表示组合后送入任务塔进行预测。
+
+---
+
+### 3. **PLE的工作流程**
+
+1. **第一层特征提取**：  
+   - 输入特征通过**共享专家**和**任务特定专家**，分别提取共享特征与任务特异性特征。
+
+2. **逐层特征提取**：  
+   - 上一层的输出继续传递给下一层的共享专家和任务特定专家，进行进一步提取。  
+   - 每一层的输出都会包含共享特征和任务特异性特征。
+
+3. **任务特定门控融合**：  
+   - 每个任务的门控网络根据任务需求，从共享专家和任务特定专家输出中选择合适的特征表示。
+
+4. **任务输出**：  
+   - 融合后的特征表示输入到任务塔，完成最终预测。
+
+---
+
+ **PLE的示意图**
+
+```
+输入特征
+    │
+┌──────────┐
+│ 第1层专家 │（共享专家 & 任务特定专家）
+└──────────┘
+    │          │          │
+  共享输出   任务1输出   任务2输出
+    │          │          │
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│ 第2层专家 │  │ 第2层专家 │  │ 第2层专家 │
+└──────────┘  └──────────┘  └──────────┘
+    │          │          │
+  共享输出   任务1输出   任务2输出
+    │          │          │
+   ...        ...        ...
+    │          │          │
+任务输出塔   任务输出塔   任务输出塔
+    │          │          │
+预测结果    预测结果    预测结果
 ```
 
 ---
 
+### 4. **PLE的优点**
+1. **任务冲突问题缓解**  
+   - 通过共享专家和任务特定专家的分离，解决了任务冲突的问题，任务间共享和独立特征更加平衡。
 
+2. **逐层特征提取**  
+   - 多层结构逐步提取共享与特定特征，使得任务间的信息传递更加高效。
+
+3. **灵活的结构**  
+   - 可根据任务需求调整专家数量和层数，适应不同复杂度的多任务学习场景。
 
 
 #### **PLE 示例代码**
 ```python
+import torch
+import torch.nn as nn
+
 class PLE(nn.Module):
-    def __init__(self, input_dim, expert_num, expert_dim, task_num):
+    def __init__(self, input_dim, num_experts, num_tasks, num_layers, hidden_dim):
         super(PLE, self).__init__()
-        # 共享专家网络
+        self.num_tasks = num_tasks
+        self.num_layers = num_layers
+        self.num_experts = num_experts
+
+        # 共享专家和任务特定专家
         self.shared_experts = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(input_dim, expert_dim),
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU()
-            ) for _ in range(expert_num)
+            ) for _ in range(num_experts)
         ])
-        # 每个任务的特定专家网络
+
         self.task_experts = nn.ModuleList([
             nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(input_dim, expert_dim),
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
                     nn.ReLU()
-                ) for _ in range(expert_num)
-            ]) for _ in range(task_num)
+                ) for _ in range(num_experts)
+            ]) for _ in range(num_tasks)
         ])
-        # 门控网络
+
+        # 门控网络（每个任务的每一层）
         self.gates = nn.ModuleList([
-            nn.Linear(input_dim, expert_num * 2) for _ in range(task_num)
+            nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(input_dim, num_experts * 2),
+                    nn.Softmax(dim=1)
+                ) for _ in range(num_layers)
+            ]) for _ in range(num_tasks)
         ])
-        # 任务特定塔层
-        self.towers = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(expert_dim, 1),
-                nn.Sigmoid()
-            ) for _ in range(task_num)
+
+        # 最后的任务输出网络（任务塔）
+        self.task_towers = nn.ModuleList([
+            nn.Linear(hidden_dim, 1) for _ in range(num_tasks)
         ])
 
     def forward(self, x):
-        # 获取共享专家的输出
-        shared_outputs = torch.stack([expert(x) for expert in self.shared_experts], dim=1)
-        task_outputs = []
-        for i, task_expert in enumerate(self.task_experts):
-            # 获取任务特定专家的输出
-            task_specific_outputs = torch.stack([expert(x) for expert in task_expert], dim=1)
-            # 拼接共享专家和任务特定专家的输出
-            all_expert_outputs = torch.cat([shared_outputs, task_specific_outputs], dim=1)
-            # 门控机制
-            gate_weights = torch.softmax(self.gates[i](x), dim=1)
-            gate_output = torch.einsum('be,bne->bn', gate_weights, all_expert_outputs)
-            # 任务特定塔层输出
-            task_outputs.append(self.towers[i](gate_output))
-        return task_outputs
+        shared_input = x  # (Batch_size, input_dim)
+        task_inputs = [x] * self.num_tasks  # 每个任务的初始输入
+
+        for layer in range(self.num_layers):
+            # 共享专家的输出
+            shared_outputs = torch.stack(
+                [expert(shared_input) for expert in self.shared_experts], dim=1
+            )  # (Batch_size, num_experts, hidden_dim)
+
+            # 每个任务的特定专家输出
+            task_outputs = []
+            for task_id in range(self.num_tasks):
+                task_expert_outputs = torch.stack(
+                    [expert(task_inputs[task_id]) for expert in self.task_experts[task_id]], dim=1
+                )  # (Batch_size, num_experts, hidden_dim)
+                task_outputs.append(task_expert_outputs)
+
+            # 门控网络选择特征
+            for task_id in range(self.num_tasks):
+                gate_input = task_inputs[task_id]  # (Batch_size, input_dim)
+                gate = self.gates[task_id][layer](gate_input)  # (Batch_size, num_experts * 2)
+
+                # 拼接共享专家和任务特定专家的输出
+                combined_outputs = torch.cat(
+                    [shared_outputs, task_outputs[task_id]], dim=1
+                )  # (Batch_size, num_experts * 2, hidden_dim)
+                gate = gate.unsqueeze(-1)  # (Batch_size, num_experts * 2, 1)
+
+                # 加权求和
+                task_inputs[task_id] = torch.sum(combined_outputs * gate, dim=1)  # (Batch_size, hidden_dim)
+
+            # 更新共享输入
+            shared_input = torch.mean(torch.stack(task_inputs), dim=0)  # (Batch_size, hidden_dim)
+
+        # 任务输出
+        outputs = [self.task_towers[task_id](task_inputs[task_id]) for task_id in range(self.num_tasks)]
+        return outputs  # 每个任务输出 (Batch_size, 1)
 ```
 
 #### 关于Experts 和 Gates：
